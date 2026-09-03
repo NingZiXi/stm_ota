@@ -5,6 +5,9 @@
 
 #include "stm_ota.h"
 
+/* A/B 槽边界由应用与 Bootloader 共用，避免 OTA 库再维护一份地址。 */
+#include "../../../common/boot_state_protocol.h"
+
 #include "esp_at_client.h"
 #include "esp_at_tcp.h"
 
@@ -17,7 +20,8 @@
 #include "semphr.h"
 #include "cmsis_os2.h"
 
-// 默认下载区与 chunk 大小
+// 兼容旧配置的默认 staging 地址；F407 片内 Flash 范围校验会拒绝它，
+// 调用方必须显式传入 BOOT_SLOT_A_BASE 或 BOOT_SLOT_B_BASE。
 #define STM_OTA_DEFAULT_DOWNLOAD_ADDR  0x08080000U
 #define STM_OTA_DEFAULT_CHUNK          512U
 #define STM_OTA_HTTP_TIMEOUT_MS        8000U
@@ -56,6 +60,10 @@ static uint32_t addr_to_sector(uint32_t addr)
 
 static int flash_erase(uint32_t addr, uint32_t size)
 {
+    /* 防御性检查：调用方应已验证，但这里也不能接受空范围或整数回绕。 */
+    if (size == 0U || addr > (UINT32_MAX - (size - 1U))) {
+        return -1;
+    }
     uint32_t start_sector = addr_to_sector(addr);
     uint32_t end_sector = addr_to_sector(addr + size - 1);
     FLASH_EraseInitTypeDef erase = {0};
@@ -69,6 +77,9 @@ static int flash_erase(uint32_t addr, uint32_t size)
 
 static int flash_write(uint32_t addr, const uint8_t *data, uint32_t len)
 {
+    if (data == NULL && len != 0U) {
+        return -1;
+    }
     for (uint32_t i = 0; i < len; i += 4) {
         uint32_t remaining = len - i;
         uint32_t word = 0xFFFFFFFFU;
@@ -78,6 +89,55 @@ static int flash_write(uint32_t addr, const uint8_t *data, uint32_t len)
             return -1;
         }
     }
+    return 0;
+}
+
+/*
+ * 只接受从槽位基址开始的连续写入。这样既能保护 Bootloader 区域，也能
+ * 防止一次 OTA 跨过 A/B 边界或写入 B 槽末尾保留的 32 KiB。
+ *
+ * 返回值为 0 表示合法，并通过 aligned_size 返回按 Flash word 写入所需的
+ * 补齐长度。Flash 最后一个 word 可能包含 0xFF 填充，因此补齐后的范围也
+ * 必须仍在槽位包上限内。
+ */
+static int validate_download_range(uint32_t addr, uint32_t total_size,
+                                   uint32_t *aligned_size)
+{
+    uint32_t slot_limit;
+
+    if (aligned_size == NULL || total_size == 0U) {
+        return -1;
+    }
+
+    if (addr == BOOT_SLOT_A_BASE) {
+        slot_limit = BOOT_SLOT_A_BASE + BOOT_SLOT_PACKAGE_SIZE;
+    } else if (addr == BOOT_SLOT_B_BASE) {
+        slot_limit = BOOT_SLOT_B_BASE + BOOT_SLOT_PACKAGE_SIZE;
+    } else {
+        return -1;
+    }
+
+    /* 槽位基址天然 4 字节对齐；保留检查以防协议地址以后被修改。 */
+    if ((addr & 0x3U) != 0U || addr >= slot_limit
+        || total_size > (UINT32_MAX - addr)) {
+        return -1;
+    }
+
+    const uint32_t end = addr + total_size;
+    if (end > slot_limit) {
+        return -1;
+    }
+
+    /* flash_write() 按 32-bit word 编程，检查补齐后的最后一个 word。 */
+    if (total_size > (UINT32_MAX - 3U)) {
+        return -1;
+    }
+    const uint32_t padded = (total_size + 3U) & ~3U;
+    if (padded > (slot_limit - addr)) {
+        return -1;
+    }
+
+    *aligned_size = padded;
     return 0;
 }
 
@@ -205,24 +265,30 @@ static int http_pull_chunk(const char *base_url, uint32_t offset, uint32_t want,
 
 stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
 {
-    if (!cfg || !cfg->url) return STM_OTA_ERR_INVALID;
+    if (!cfg || !cfg->url || cfg->url[0] == '\0') {
+        return STM_OTA_ERR_INVALID;
+    }
+
     uint32_t addr = cfg->download_addr ? cfg->download_addr : STM_OTA_DEFAULT_DOWNLOAD_ADDR;
     uint32_t chunk = cfg->chunk_size ? cfg->chunk_size : STM_OTA_DEFAULT_CHUNK;
     uint32_t total = cfg->total_size;
+    static uint8_t s_buf[STM_OTA_DEFAULT_CHUNK];      // 跳过 heap：测试期不依赖 malloc
+    uint32_t programmed_size = 0U;
+
+    /* 所有参数先校验，再解锁/擦除 Flash，避免错误配置造成破坏性副作用。 */
+    if (validate_download_range(addr, total, &programmed_size) != 0
+        || chunk > sizeof s_buf) {
+        return STM_OTA_ERR_INVALID;
+    }
 
     if (flash_unlock() != 0) return STM_OTA_ERR_FLASH;
-    if (flash_erase(addr, total) != 0) {
+    if (flash_erase(addr, programmed_size) != 0) {
         flash_lock();
         return STM_OTA_ERR_FLASH;
     }
 
     uint32_t done = 0;
     uint32_t download_crc = 0xFFFFFFFFU;
-    static uint8_t s_buf[STM_OTA_DEFAULT_CHUNK];      // 跳过 heap：测试期不依赖 malloc
-    if (chunk > sizeof s_buf) {
-        flash_lock();
-        return STM_OTA_ERR_INVALID;
-    }
 
     while (done < total) {
         uint32_t want = total - done;
