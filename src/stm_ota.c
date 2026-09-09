@@ -211,10 +211,132 @@ static int find_header_end(const uint8_t *resp, uint32_t len)
     return -1;
 }
 
+static int hex_digit_value(uint8_t ch)
+{
+    if (ch >= '0' && ch <= '9') return (int)(ch - '0');
+    if (ch >= 'A' && ch <= 'F') return (int)(ch - 'A') + 10;
+    if (ch >= 'a' && ch <= 'f') return (int)(ch - 'a') + 10;
+    return -1;
+}
+
+static uint8_t ascii_lower(uint8_t ch)
+{
+    return (ch >= 'A' && ch <= 'Z') ? (uint8_t)(ch + ('a' - 'A')) : ch;
+}
+
+static bool header_name_equal(const uint8_t *text, const char *name,
+                              uint32_t len)
+{
+    for (uint32_t i = 0U; i < len; i++) {
+        if (ascii_lower(text[i]) != ascii_lower((uint8_t)name[i])) return false;
+    }
+    return true;
+}
+
+/* 从完整 HTTP 头中读取一个最多 8 位的十六进制 uint32。 */
+static int parse_hex_header(const uint8_t *resp, uint32_t header_len,
+                            const char *name, uint32_t *value)
+{
+    if (resp == NULL || name == NULL || value == NULL) return -1;
+
+    const uint32_t name_len = (uint32_t)strlen(name);
+    uint32_t line_start = 0U;
+    while (line_start + 1U < header_len) {
+        uint32_t line_end = line_start;
+        while (line_end + 1U < header_len
+               && !(resp[line_end] == '\r' && resp[line_end + 1U] == '\n')) {
+            line_end++;
+        }
+        if (line_end + 1U >= header_len) break;
+
+        if (line_end > line_start + name_len
+            && header_name_equal(resp + line_start, name, name_len)
+            && resp[line_start + name_len] == ':') {
+            uint32_t pos = line_start + name_len + 1U;
+            while (pos < line_end && (resp[pos] == ' ' || resp[pos] == '\t')) pos++;
+
+            uint32_t parsed = 0U;
+            uint32_t digits = 0U;
+            while (pos < line_end) {
+                const int digit = hex_digit_value(resp[pos++]);
+                if (digit < 0 || digits >= 8U) return -1;
+                parsed = (parsed << 4) | (uint32_t)digit;
+                digits++;
+            }
+            if (digits == 0U) return -1;
+            *value = parsed;
+            return 0;
+        }
+        line_start = line_end + 2U;
+    }
+    return -1;
+}
+
+/* 解析 Content-Range: bytes <start>-<end>/<total>。 */
+static int parse_content_range(const uint8_t *resp, uint32_t header_len,
+                               uint32_t *start, uint32_t *end,
+                               uint32_t *total)
+{
+    static const char name[] = "Content-Range";
+    const uint32_t name_len = (uint32_t)strlen(name);
+    uint32_t line_start = 0U;
+
+    if (resp == NULL || start == NULL || end == NULL || total == NULL) return -1;
+
+    while (line_start + 1U < header_len) {
+        uint32_t line_end = line_start;
+        while (line_end + 1U < header_len
+               && !(resp[line_end] == '\r' && resp[line_end + 1U] == '\n')) {
+            line_end++;
+        }
+        if (line_end + 1U >= header_len) break;
+
+        if (line_end > line_start + name_len
+            && header_name_equal(resp + line_start, name, name_len)
+            && resp[line_start + name_len] == ':') {
+            uint32_t pos = line_start + name_len + 1U;
+            while (pos < line_end && (resp[pos] == ' ' || resp[pos] == '\t')) pos++;
+            if (pos + 6U > line_end || memcmp(resp + pos, "bytes ", 6U) != 0) return -1;
+            pos += 6U;
+
+            uint32_t values[3] = {0U, 0U, 0U};
+            for (uint32_t i = 0U; i < 3U; i++) {
+                uint32_t digits = 0U;
+                while (pos < line_end && resp[pos] >= '0' && resp[pos] <= '9') {
+                    const uint32_t digit = (uint32_t)(resp[pos++] - '0');
+                    if (values[i] > (0xFFFFFFFFU - digit) / 10U) return -1;
+                    values[i] = values[i] * 10U + digit;
+                    digits++;
+                }
+                if (digits == 0U) return -1;
+                if (i == 0U && pos < line_end && resp[pos] == '-') pos++;
+                else if (i == 1U && pos < line_end && resp[pos] == '/') pos++;
+                else if (i < 2U) return -1;
+            }
+            if (pos != line_end) return -1;
+            *start = values[0];
+            *end = values[1];
+            *total = values[2];
+            return 0;
+        }
+        line_start = line_end + 2U;
+    }
+    return -1;
+}
+
+static void http_close(void)
+{
+    if (s_connected) {
+        esp_at_tcp_close(&s_tcp);
+        s_connected = false;
+    }
+}
+
 // HTTP 拉 1 个 chunk：raw TCP 长连接 + Range 头
 // host/port/path/tcp 在首次调用时建连接，后续复用
 static int http_pull_chunk(const char *base_url, uint32_t offset, uint32_t want,
-                            uint8_t *out, uint32_t *got)
+                           uint8_t *out, uint32_t *got,
+                           uint32_t *package_crc32)
 {
     if (!s_connected) {
         if (parse_url(base_url, s_host, sizeof s_host, &s_port, s_path, sizeof s_path) != 0) {
@@ -254,12 +376,60 @@ static int http_pull_chunk(const char *base_url, uint32_t offset, uint32_t want,
         return -1;
     }
 
+    if (got_bytes < 12U
+        || (memcmp(s_resp, "HTTP/1.1 206", 12U) != 0
+            && memcmp(s_resp, "HTTP/1.0 206", 12U) != 0)) {
+        LOGE("ota", "HTTP Range response is not 206");
+        esp_at_tcp_close(&s_tcp);
+        s_connected = false;
+        return -1;
+    }
+    if (parse_hex_header(s_resp, (uint32_t)hdr_end,
+                         "X-CRC32", package_crc32) != 0) {
+        LOGE("ota", "HTTP response missing valid X-CRC32");
+        esp_at_tcp_close(&s_tcp);
+        s_connected = false;
+        return -1;
+    }
+
     uint32_t body_off = (uint32_t)hdr_end;
     uint32_t body_len = got_bytes - body_off;
-    if (body_len > want) body_len = want;
+    uint32_t range_start = 0U;
+    uint32_t range_end = 0U;
+    uint32_t range_total = 0U;
+    if (parse_content_range(s_resp, (uint32_t)hdr_end,
+                            &range_start, &range_end, &range_total) != 0
+        || range_start != offset
+        || range_end < range_start
+        || (range_end - range_start + 1U) != want
+        || body_len != want) {
+        LOGE("ota", "HTTP range mismatch: req=%lu-%lu body=%lu "
+             "content-range=%lu-%lu/%lu",
+             (unsigned long)offset,
+             (unsigned long)(offset + want - 1U),
+             (unsigned long)body_len,
+             (unsigned long)range_start,
+             (unsigned long)range_end,
+             (unsigned long)range_total);
+        esp_at_tcp_close(&s_tcp);
+        s_connected = false;
+        return -1;
+    }
     memcpy(out, s_resp + body_off, body_len);
     *got = body_len;
-    LOGD("ota", "chunk %lu got %u body bytes (hdr_end=%d)", offset, (unsigned)body_len, hdr_end);
+    LOGI("ota", "range %lu-%lu body=%lu first=%02X%02X%02X%02X "
+         "last=%02X%02X%02X%02X",
+         (unsigned long)range_start,
+         (unsigned long)range_end,
+         (unsigned long)body_len,
+         (unsigned)s_resp[body_off + 0U],
+         (unsigned)s_resp[body_off + 1U],
+         (unsigned)s_resp[body_off + 2U],
+         (unsigned)s_resp[body_off + 3U],
+         (unsigned)s_resp[body_off + body_len - 4U],
+         (unsigned)s_resp[body_off + body_len - 3U],
+         (unsigned)s_resp[body_off + body_len - 2U],
+         (unsigned)s_resp[body_off + body_len - 1U]);
     return 0;
 }
 
@@ -289,15 +459,30 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
 
     uint32_t done = 0;
     uint32_t download_crc = 0xFFFFFFFFU;
+    uint32_t package_crc = cfg->crc32_expected;
+    bool package_crc_known = cfg->crc32_expected != 0U;
 
     while (done < total) {
         uint32_t want = total - done;
         if (want > chunk) want = chunk;
 
         uint32_t got = 0;
-        if (http_pull_chunk(cfg->url, done, want, s_buf, &got) != 0) {
+        uint32_t response_crc = 0U;
+        if (http_pull_chunk(cfg->url, done, want, s_buf, &got,
+                            &response_crc) != 0) {
             flash_lock();
             return STM_OTA_ERR_HTTP;
+        }
+        if (!package_crc_known) {
+            package_crc = response_crc;
+            package_crc_known = true;
+            LOGI("ota", "server package crc=0x%08lX", (unsigned long)package_crc);
+        } else if (response_crc != package_crc) {
+            LOGE("ota", "package CRC header changed: 0x%08lX -> 0x%08lX",
+                 (unsigned long)package_crc, (unsigned long)response_crc);
+            flash_lock();
+            http_close();
+            return STM_OTA_ERR_CRC;
         }
         if (got == 0) break;
 
@@ -305,6 +490,7 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
         download_crc = crc32_update(download_crc, s_buf, got);
         if (flash_write(addr + done, s_buf, got) != 0) {
             flash_lock();
+            http_close();
             return STM_OTA_ERR_FLASH;
         }
         uint32_t flash_crc = stm_ota_crc32((const uint8_t *)(addr + done), got);
@@ -313,6 +499,7 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
              (unsigned long)chunk_crc, (unsigned long)flash_crc);
         if (flash_crc != chunk_crc) {
             flash_lock();
+            http_close();
             return STM_OTA_ERR_FLASH;
         }
         done += got;
@@ -323,22 +510,21 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
     }
     flash_lock();
 
-    if (s_connected) {
-        esp_at_tcp_close(&s_tcp);
-        s_connected = false;
-    }
+    http_close();
 
     if (done != total) return STM_OTA_ERR_HTTP;
 
-    if (cfg->crc32_expected) {
+    if (package_crc_known) {
         uint32_t rx_crc = download_crc ^ 0xFFFFFFFFU;
         uint32_t flash_crc = stm_ota_crc32((const uint8_t *)addr, total);
         LOGI("ota", "final rx_crc=0x%08lX flash_crc=0x%08lX expected=0x%08lX",
              (unsigned long)rx_crc, (unsigned long)flash_crc,
-             (unsigned long)cfg->crc32_expected);
-        if (rx_crc != cfg->crc32_expected || flash_crc != cfg->crc32_expected) {
+             (unsigned long)package_crc);
+        if (rx_crc != package_crc || flash_crc != package_crc) {
             return STM_OTA_ERR_CRC;
         }
+    } else {
+        return STM_OTA_ERR_CRC;
     }
 
     return STM_OTA_OK;

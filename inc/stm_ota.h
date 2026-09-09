@@ -34,7 +34,8 @@ typedef struct {
     uint32_t    download_addr;
     /* 必须大于 0，且完整下载范围不能越过目标槽的 OTA 包上限。 */
     uint32_t    total_size;
-    uint32_t    crc32_expected;        // 0 = 不校验
+    /* 0 表示从首个 HTTP Range 响应的 X-CRC32 读取整包 CRC。 */
+    uint32_t    crc32_expected;
     uint32_t    chunk_size;            // 默认 512，<= 1400（AT_RESP_TEXT_MAX 推荐）
     stm_ota_progress_cb_t progress_cb;
     void       *progress_user;
