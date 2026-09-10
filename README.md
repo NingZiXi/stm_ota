@@ -6,6 +6,10 @@ STM32 OTA 库：通过 ESP32 HTTP GET 拉固件，写本地 flash。
 版本、目标槽、包大小和整包 CRC。应用可在擦除 Flash 前拒绝同版本、低版本或槽位
 不匹配的包。
 
+下载进度保存在 STM32F407 的 RTC 备份寄存器 `BKP3R..BKP10R`。每个分片完成 Flash
+写入和读回 CRC 后更新下一偏移及前缀 CRC；复位后只有目标地址、包大小、整包 CRC、
+分片大小、状态校验和及 Flash 前缀 CRC 全部匹配，才从断点继续，否则自动整槽重下。
+
 ## 边界
 
 - **只调 `esp_at_client` 公开 API**（`esp_at_tcp.h`）

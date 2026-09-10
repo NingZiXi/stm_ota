@@ -28,6 +28,17 @@
 #define STM_OTA_HTTP_TIMEOUT_MS        8000U
 #define STM_OTA_FLAG_ADDR              0x40024000U   // 备份寄存器：实际放 (BKP_BASE + 0x04)
 #define STM_OTA_FLAG_MAGIC             0x0FADE001U
+#define STM_OTA_RESUME_MAGIC           0x3152544FU   // "OTR1"
+
+/* BKP3R..BKP10R 保存 OTA 断点；BKP1R/BKP2R 继续由 Bootloader 状态协议使用。 */
+typedef struct {
+    uint32_t download_addr;
+    uint32_t total_size;
+    uint32_t package_crc32;
+    uint32_t chunk_size;
+    uint32_t next_offset;
+    uint32_t prefix_crc32;
+} stm_ota_resume_state_t;
 
 // flash 工具（HAL 直调，限定 STM32F4）
 static int flash_unlock(void)
@@ -158,6 +169,97 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
 uint32_t stm_ota_crc32(const uint8_t *data, uint32_t len)
 {
     return crc32_update(0xFFFFFFFFU, data, len) ^ 0xFFFFFFFFU;
+}
+
+static uint32_t resume_state_crc32(const stm_ota_resume_state_t *state)
+{
+    return stm_ota_crc32((const uint8_t *)state, sizeof *state);
+}
+
+static void resume_backup_write_begin(void)
+{
+    __HAL_RCC_PWR_CLK_ENABLE();
+    HAL_PWR_EnableBkUpAccess();
+}
+
+static void resume_backup_write_end(void)
+{
+    HAL_PWR_DisableBkUpAccess();
+}
+
+static void resume_state_clear(void)
+{
+    resume_backup_write_begin();
+    WRITE_REG(RTC->BKP3R, 0U);
+    __DSB();
+    WRITE_REG(RTC->BKP4R, 0U);
+    WRITE_REG(RTC->BKP5R, 0U);
+    WRITE_REG(RTC->BKP6R, 0U);
+    WRITE_REG(RTC->BKP7R, 0U);
+    WRITE_REG(RTC->BKP8R, 0U);
+    WRITE_REG(RTC->BKP9R, 0U);
+    WRITE_REG(RTC->BKP10R, 0U);
+    resume_backup_write_end();
+}
+
+/* magic 最后写入；若复位发生在更新中间，下一次会把该断点视为无效。 */
+static void resume_state_save(const stm_ota_resume_state_t *state)
+{
+    const uint32_t state_crc = resume_state_crc32(state);
+
+    resume_backup_write_begin();
+    WRITE_REG(RTC->BKP3R, 0U);
+    __DSB();
+    WRITE_REG(RTC->BKP4R, state->download_addr);
+    WRITE_REG(RTC->BKP5R, state->total_size);
+    WRITE_REG(RTC->BKP6R, state->package_crc32);
+    WRITE_REG(RTC->BKP7R, state->chunk_size);
+    WRITE_REG(RTC->BKP8R, state->next_offset);
+    WRITE_REG(RTC->BKP9R, state->prefix_crc32);
+    WRITE_REG(RTC->BKP10R, state_crc);
+    __DSB();
+    WRITE_REG(RTC->BKP3R, STM_OTA_RESUME_MAGIC);
+    __DSB();
+    resume_backup_write_end();
+}
+
+static bool resume_state_load(uint32_t addr, uint32_t total,
+                              uint32_t package_crc, uint32_t chunk,
+                              stm_ota_resume_state_t *state,
+                              bool *state_present)
+{
+    if (state == NULL || state_present == NULL) return false;
+
+    resume_backup_write_begin();
+    *state_present = READ_REG(RTC->BKP3R) == STM_OTA_RESUME_MAGIC;
+    if (!*state_present) {
+        resume_backup_write_end();
+        return false;
+    }
+
+    state->download_addr = READ_REG(RTC->BKP4R);
+    state->total_size = READ_REG(RTC->BKP5R);
+    state->package_crc32 = READ_REG(RTC->BKP6R);
+    state->chunk_size = READ_REG(RTC->BKP7R);
+    state->next_offset = READ_REG(RTC->BKP8R);
+    state->prefix_crc32 = READ_REG(RTC->BKP9R);
+    const uint32_t saved_crc = READ_REG(RTC->BKP10R);
+    resume_backup_write_end();
+
+    if (saved_crc != resume_state_crc32(state)
+        || state->download_addr != addr
+        || state->total_size != total
+        || state->package_crc32 != package_crc
+        || state->chunk_size != chunk
+        || state->next_offset > total
+        || (state->next_offset != total
+            && (state->next_offset % chunk) != 0U)) {
+        return false;
+    }
+
+    const uint32_t flash_crc = stm_ota_crc32((const uint8_t *)addr,
+                                             state->next_offset);
+    return flash_crc == state->prefix_crc32;
 }
 
 // 解析 URL：http://host[:port]/path
@@ -591,16 +693,50 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
         return STM_OTA_ERR_INVALID;
     }
 
-    if (flash_unlock() != 0) return STM_OTA_ERR_FLASH;
-    if (flash_erase(addr, programmed_size) != 0) {
-        flash_lock();
-        return STM_OTA_ERR_FLASH;
-    }
-
     uint32_t done = 0;
     uint32_t download_crc = 0xFFFFFFFFU;
     uint32_t package_crc = cfg->crc32_expected;
     bool package_crc_known = cfg->crc32_expected != 0U;
+    bool resume_present = false;
+    bool resume_accepted = false;
+    stm_ota_resume_state_t resume = {0};
+
+    if (package_crc_known
+        && resume_state_load(addr, total, package_crc, chunk,
+                             &resume, &resume_present)) {
+        done = resume.next_offset;
+        download_crc = resume.prefix_crc32 ^ 0xFFFFFFFFU;
+        resume_accepted = true;
+        LOGI("ota", "resume accepted offset=%lu/%lu prefix_crc=0x%08lX",
+             (unsigned long)done, (unsigned long)total,
+             (unsigned long)resume.prefix_crc32);
+    } else if (resume_present) {
+        LOGW("ota", "resume state rejected, restart from offset 0");
+        resume_state_clear();
+    }
+
+    if (flash_unlock() != 0) {
+        resume_state_clear();
+        return STM_OTA_ERR_FLASH;
+    }
+    if (!resume_accepted) {
+        if (flash_erase(addr, programmed_size) != 0) {
+            flash_lock();
+            resume_state_clear();
+            return STM_OTA_ERR_FLASH;
+        }
+        if (package_crc_known) {
+            resume = (stm_ota_resume_state_t) {
+                .download_addr = addr,
+                .total_size = total,
+                .package_crc32 = package_crc,
+                .chunk_size = chunk,
+                .next_offset = 0U,
+                .prefix_crc32 = 0U,
+            };
+            resume_state_save(&resume);
+        }
+    }
 
     while (done < total) {
         uint32_t want = total - done;
@@ -622,6 +758,7 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
                  (unsigned long)package_crc, (unsigned long)response_crc);
             flash_lock();
             http_close();
+            resume_state_clear();
             return STM_OTA_ERR_CRC;
         }
         if (got == 0) break;
@@ -631,6 +768,7 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
         if (flash_write(addr + done, s_buf, got) != 0) {
             flash_lock();
             http_close();
+            resume_state_clear();
             return STM_OTA_ERR_FLASH;
         }
         uint32_t flash_crc = stm_ota_crc32((const uint8_t *)(addr + done), got);
@@ -640,9 +778,20 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
         if (flash_crc != chunk_crc) {
             flash_lock();
             http_close();
+            resume_state_clear();
             return STM_OTA_ERR_FLASH;
         }
         done += got;
+
+        if (package_crc_known) {
+            resume.download_addr = addr;
+            resume.total_size = total;
+            resume.package_crc32 = package_crc;
+            resume.chunk_size = chunk;
+            resume.next_offset = done;
+            resume.prefix_crc32 = download_crc ^ 0xFFFFFFFFU;
+            resume_state_save(&resume);
+        }
 
         if (cfg->progress_cb) {
             cfg->progress_cb(done, total, cfg->progress_user);
@@ -661,12 +810,15 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
              (unsigned long)rx_crc, (unsigned long)flash_crc,
              (unsigned long)package_crc);
         if (rx_crc != package_crc || flash_crc != package_crc) {
+            resume_state_clear();
             return STM_OTA_ERR_CRC;
         }
     } else {
+        resume_state_clear();
         return STM_OTA_ERR_CRC;
     }
 
+    resume_state_clear();
     return STM_OTA_OK;
 }
 
