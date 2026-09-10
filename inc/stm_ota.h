@@ -25,6 +25,13 @@ typedef enum {
 typedef void (*stm_ota_progress_cb_t)(uint32_t done, uint32_t total, void *user);
 
 typedef struct {
+    uint32_t image_version;           // 远端镜像版本（MAJOR.MINOR.PATCH 打包值）
+    uint32_t package_size;            // 完整 OTA 包大小
+    uint32_t package_crc32;           // 完整 OTA 包 CRC32
+    uint8_t  target_slot;             // 目标槽：0=A，1=B
+} stm_ota_image_info_t;
+
+typedef struct {
     const char *url;                  // 必填，HTTP URL（服务端需支持 Range）
     /*
      * STM32F407 A/B 工程中必须填写槽位基址（0x08008000 或 0x08040000）。
@@ -40,6 +47,14 @@ typedef struct {
     stm_ota_progress_cb_t progress_cb;
     void       *progress_user;
 } stm_ota_config_t;
+
+/**
+ * @brief 读取远端镜像信息，不擦除或写入 Flash
+ *
+ * 通过一个极小的 HTTP Range 请求读取服务端响应头，供应用在完整下载前完成
+ * 版本、槽位和包大小检查。
+ */
+stm_ota_err_t stm_ota_probe(const char *url, stm_ota_image_info_t *info);
 
 /**
  * @brief HTTP 拉固件 chunk → 写 STM32 flash → CRC 校验

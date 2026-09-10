@@ -2,9 +2,13 @@
 
 STM32 OTA 库：通过 ESP32 HTTP GET 拉固件，写本地 flash。
 
+完整下载前可调用 `stm_ota_probe()`，通过 8 字节 Range 请求读取服务端响应头中的
+版本、目标槽、包大小和整包 CRC。应用可在擦除 Flash 前拒绝同版本、低版本或槽位
+不匹配的包。
+
 ## 边界
 
-- **只调 `esp_at_client` 公开 API**（`esp_at_http_get`）
+- **只调 `esp_at_client` 公开 API**（`esp_at_tcp.h`）
 - 不直接碰 ringbuffer / `esp_at_internal.h`
 - 内部用 STM32F4 HAL 写 flash（限 STM32F4 系列）
 
@@ -37,7 +41,13 @@ stm_ota_config_t cfg = {
     .progress_cb    = on_progress,
 };
 
-stm_ota_err_t r = stm_ota_download(&cfg);
+stm_ota_image_info_t remote = {0};
+stm_ota_err_t r = stm_ota_probe(cfg.url, &remote);
+if (r == STM_OTA_OK) {
+    cfg.total_size = remote.package_size;
+    cfg.crc32_expected = remote.package_crc32;
+    r = stm_ota_download(&cfg);
+}
 if (r == STM_OTA_OK) {
     stm_ota_request_reboot();    // 写 flag + NVIC_SystemReset
 }
@@ -45,14 +55,13 @@ if (r == STM_OTA_OK) {
 
 ## 服务端协议
 
-STM32 发起 `GET <url>?offset=N&len=M`，服务端返回 `[offset, offset+M)` 字节的 raw 固件数据。
-
-服务端例子（Python）：见主项目 `D:\hs_project\stm_ota_server\stm_ota_server.py`（待开发）。
+STM32 使用标准 `Range: bytes=N-M` 请求分块读取固件。服务端返回 `206 Partial Content`，
+并提供 `Content-Range`、`X-CRC32`、`X-Firmware-Version-Code`、`X-Firmware-Slot` 和
+`X-Firmware-Size` 响应头。配套服务端位于主工程 `tools/ota_server/ota_server.py`。
 
 ## 已知坑
 
-- **ESP-AT `AT+HTTPCLIENT` 不支持 `Range` header**，所以 STM32 端用 URL `?offset=N&len=M` query 参数把 offset 传给服务端。
-- **bootloader 入口**：`stm_ota_request_reboot` 写备份寄存器 magic + 复位，**bootloader 还没实现**（下一步）。
+- **ESP-AT `AT+HTTPCLIENT` 不支持自定义 `Range` header**，所以本库通过 raw TCP 自行发送 HTTP/1.1 请求。
 - **限定 STM32F4 系列**（HAL 直调），其他 STM32 系列要改 `flash_*` 实现。
 
 ## 目录

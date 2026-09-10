@@ -24,6 +24,7 @@
 // 调用方必须显式传入 BOOT_SLOT_A_BASE 或 BOOT_SLOT_B_BASE。
 #define STM_OTA_DEFAULT_DOWNLOAD_ADDR  0x08080000U
 #define STM_OTA_DEFAULT_CHUNK          512U
+#define STM_OTA_PREFLIGHT_BYTES        8U
 #define STM_OTA_HTTP_TIMEOUT_MS        8000U
 #define STM_OTA_FLAG_ADDR              0x40024000U   // 备份寄存器：实际放 (BKP_BASE + 0x04)
 #define STM_OTA_FLAG_MAGIC             0x0FADE001U
@@ -255,6 +256,12 @@ static int parse_hex_header(const uint8_t *resp, uint32_t header_len,
             uint32_t pos = line_start + name_len + 1U;
             while (pos < line_end && (resp[pos] == ' ' || resp[pos] == '\t')) pos++;
 
+            /* 兼容 X-CRC32 的纯十六进制和 Version-Code 的 0x 前缀。 */
+            if (pos + 2U <= line_end && resp[pos] == '0'
+                && (resp[pos + 1U] == 'x' || resp[pos + 1U] == 'X')) {
+                pos += 2U;
+            }
+
             uint32_t parsed = 0U;
             uint32_t digits = 0U;
             while (pos < line_end) {
@@ -266,6 +273,84 @@ static int parse_hex_header(const uint8_t *resp, uint32_t header_len,
             if (digits == 0U) return -1;
             *value = parsed;
             return 0;
+        }
+        line_start = line_end + 2U;
+    }
+    return -1;
+}
+
+/* 从完整 HTTP 头中读取一个十进制 uint32。 */
+static int parse_decimal_header(const uint8_t *resp, uint32_t header_len,
+                                const char *name, uint32_t *value)
+{
+    if (resp == NULL || name == NULL || value == NULL) return -1;
+
+    const uint32_t name_len = (uint32_t)strlen(name);
+    uint32_t line_start = 0U;
+    while (line_start + 1U < header_len) {
+        uint32_t line_end = line_start;
+        while (line_end + 1U < header_len
+               && !(resp[line_end] == '\r' && resp[line_end + 1U] == '\n')) {
+            line_end++;
+        }
+        if (line_end + 1U >= header_len) break;
+
+        if (line_end > line_start + name_len
+            && header_name_equal(resp + line_start, name, name_len)
+            && resp[line_start + name_len] == ':') {
+            uint32_t pos = line_start + name_len + 1U;
+            while (pos < line_end && (resp[pos] == ' ' || resp[pos] == '\t')) pos++;
+
+            uint32_t parsed = 0U;
+            uint32_t digits = 0U;
+            while (pos < line_end && resp[pos] >= '0' && resp[pos] <= '9') {
+                const uint32_t digit = (uint32_t)(resp[pos++] - '0');
+                if (parsed > (UINT32_MAX - digit) / 10U) return -1;
+                parsed = parsed * 10U + digit;
+                digits++;
+            }
+            if (digits == 0U || pos != line_end) return -1;
+            *value = parsed;
+            return 0;
+        }
+        line_start = line_end + 2U;
+    }
+    return -1;
+}
+
+/* 读取 X-Firmware-Slot，只接受单字符 A/B。 */
+static int parse_slot_header(const uint8_t *resp, uint32_t header_len,
+                             uint8_t *slot)
+{
+    static const char name[] = "X-Firmware-Slot";
+    const uint32_t name_len = (uint32_t)strlen(name);
+    uint32_t line_start = 0U;
+
+    if (resp == NULL || slot == NULL) return -1;
+
+    while (line_start + 1U < header_len) {
+        uint32_t line_end = line_start;
+        while (line_end + 1U < header_len
+               && !(resp[line_end] == '\r' && resp[line_end + 1U] == '\n')) {
+            line_end++;
+        }
+        if (line_end + 1U >= header_len) break;
+
+        if (line_end > line_start + name_len
+            && header_name_equal(resp + line_start, name, name_len)
+            && resp[line_start + name_len] == ':') {
+            uint32_t pos = line_start + name_len + 1U;
+            while (pos < line_end && (resp[pos] == ' ' || resp[pos] == '\t')) pos++;
+            if (pos + 1U != line_end) return -1;
+            if (resp[pos] == 'A' || resp[pos] == 'a') {
+                *slot = 0U;
+                return 0;
+            }
+            if (resp[pos] == 'B' || resp[pos] == 'b') {
+                *slot = 1U;
+                return 0;
+            }
+            return -1;
         }
         line_start = line_end + 2U;
     }
@@ -336,8 +421,14 @@ static void http_close(void)
 // host/port/path/tcp 在首次调用时建连接，后续复用
 static int http_pull_chunk(const char *base_url, uint32_t offset, uint32_t want,
                            uint8_t *out, uint32_t *got,
-                           uint32_t *package_crc32)
+                           uint32_t *package_crc32,
+                           stm_ota_image_info_t *image_info)
 {
+    if (base_url == NULL || out == NULL || got == NULL
+        || package_crc32 == NULL || want == 0U) {
+        return -1;
+    }
+
     if (!s_connected) {
         if (parse_url(base_url, s_host, sizeof s_host, &s_port, s_path, sizeof s_path) != 0) {
             LOGE("ota", "bad url: %s", base_url);
@@ -415,6 +506,28 @@ static int http_pull_chunk(const char *base_url, uint32_t offset, uint32_t want,
         s_connected = false;
         return -1;
     }
+
+    if (image_info != NULL) {
+        uint32_t image_version = 0U;
+        uint32_t package_size = 0U;
+        uint8_t target_slot = 0xFFU;
+        if (parse_hex_header(s_resp, (uint32_t)hdr_end,
+                             "X-Firmware-Version-Code", &image_version) != 0
+            || parse_decimal_header(s_resp, (uint32_t)hdr_end,
+                                    "X-Firmware-Size", &package_size) != 0
+            || parse_slot_header(s_resp, (uint32_t)hdr_end, &target_slot) != 0
+            || package_size != range_total) {
+            LOGE("ota", "HTTP response missing or inconsistent image metadata");
+            esp_at_tcp_close(&s_tcp);
+            s_connected = false;
+            return -1;
+        }
+        image_info->image_version = image_version;
+        image_info->package_size = package_size;
+        image_info->package_crc32 = *package_crc32;
+        image_info->target_slot = target_slot;
+    }
+
     memcpy(out, s_resp + body_off, body_len);
     *got = body_len;
     LOGI("ota", "range %lu-%lu body=%lu first=%02X%02X%02X%02X "
@@ -431,6 +544,33 @@ static int http_pull_chunk(const char *base_url, uint32_t offset, uint32_t want,
          (unsigned)s_resp[body_off + body_len - 2U],
          (unsigned)s_resp[body_off + body_len - 1U]);
     return 0;
+}
+
+stm_ota_err_t stm_ota_probe(const char *url, stm_ota_image_info_t *info)
+{
+    if (url == NULL || url[0] == '\0' || info == NULL) {
+        return STM_OTA_ERR_INVALID;
+    }
+
+    memset(info, 0, sizeof *info);
+    info->target_slot = 0xFFU;
+
+    uint8_t probe[STM_OTA_PREFLIGHT_BYTES];
+    uint32_t got = 0U;
+    uint32_t package_crc = 0U;
+    const int rc = http_pull_chunk(url, 0U, sizeof probe, probe, &got,
+                                   &package_crc, info);
+    http_close();
+    if (rc != 0 || got != sizeof probe) {
+        return STM_OTA_ERR_HTTP;
+    }
+
+    LOGI("ota", "preflight slot=%c version=0x%08lX size=%lu crc=0x%08lX",
+         info->target_slot == 0U ? 'A' : info->target_slot == 1U ? 'B' : '?',
+         (unsigned long)info->image_version,
+         (unsigned long)info->package_size,
+         (unsigned long)info->package_crc32);
+    return STM_OTA_OK;
 }
 
 stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
@@ -469,7 +609,7 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
         uint32_t got = 0;
         uint32_t response_crc = 0U;
         if (http_pull_chunk(cfg->url, done, want, s_buf, &got,
-                            &response_crc) != 0) {
+                            &response_crc, NULL) != 0) {
             flash_lock();
             return STM_OTA_ERR_HTTP;
         }
