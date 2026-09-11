@@ -30,6 +30,14 @@
 #define STM_OTA_FLAG_MAGIC             0x0FADE001U
 #define STM_OTA_RESUME_MAGIC           0x3152544FU   // "OTR1"
 
+/*
+ * 测试故障注入：仅测试构建可将其设为 1-based 的 flash_write() 调用序号，
+ * 该次写入返回失败而不触碰 Flash。正式构建保持为 0，完全关闭注入。
+ */
+#ifndef CONFIG_OTA_TEST_FLASH_FAIL_CHUNK
+#define CONFIG_OTA_TEST_FLASH_FAIL_CHUNK 0U
+#endif
+
 /* BKP3R..BKP10R 保存 OTA 断点；BKP1R/BKP2R 继续由 Bootloader 状态协议使用。 */
 typedef struct {
     uint32_t download_addr;
@@ -89,9 +97,21 @@ static int flash_erase(uint32_t addr, uint32_t size)
 
 static int flash_write(uint32_t addr, const uint8_t *data, uint32_t len)
 {
+    static uint32_t s_flash_write_calls;
+
     if (data == NULL && len != 0U) {
         return -1;
     }
+
+    s_flash_write_calls++;
+#if CONFIG_OTA_TEST_FLASH_FAIL_CHUNK > 0
+    if (s_flash_write_calls == CONFIG_OTA_TEST_FLASH_FAIL_CHUNK) {
+        LOGW("ota", "test fault injection: Flash write call %lu failed",
+             (unsigned long)s_flash_write_calls);
+        return -1;
+    }
+#endif
+
     for (uint32_t i = 0; i < len; i += 4) {
         uint32_t remaining = len - i;
         uint32_t word = 0xFFFFFFFFU;
