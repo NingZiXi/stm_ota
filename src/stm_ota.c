@@ -225,7 +225,7 @@ static void resume_state_clear(void)
     resume_backup_write_end();
 }
 
-/* magic 最后写入；若复位发生在更新中间，下一次会把该断点视为无效。 */
+/* 魔数最后写入；若复位发生在更新中间，下一次会把该断点视为无效。 */
 static void resume_state_save(const stm_ota_resume_state_t *state)
 {
     const uint32_t state_crc = resume_state_crc32(state);
