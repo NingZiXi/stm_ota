@@ -65,7 +65,7 @@ STM32 使用标准 `Range: bytes=N-M` 请求分块读取固件。服务端返回
 
 ## 已知坑
 
-- **ESP-AT `AT+HTTPCLIENT` 不支持自定义 `Range` header**，所以本库通过 raw TCP 自行发送 HTTP/1.1 请求。
+- **ESP-AT `AT+HTTPCLIENT` 不支持自定义 `Range` header**，所以本库通过原始 TCP 自行发送 HTTP/1.1 请求。
 - **限定 STM32F4 系列**（HAL 直调），其他 STM32 系列要改 `flash_*` 实现。
 
 ## 目录

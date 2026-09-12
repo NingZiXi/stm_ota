@@ -5,7 +5,7 @@
 
 #include "stm_ota.h"
 
-/* A/B 槽边界由应用与 Bootloader 共用，避免 OTA 库再维护一份地址。 */
+/* A/B 槽边界由应用与 Bootloader 共用，避免 OTA 库重复维护地址。 */
 #include "../../../common/boot_state_protocol.h"
 
 #include "esp_at_client.h"
@@ -20,7 +20,7 @@
 #include "semphr.h"
 #include "cmsis_os2.h"
 
-// 兼容旧配置的默认 staging 地址；F407 片内 Flash 范围校验会拒绝它，
+// 兼容旧配置的默认暂存地址；F407 片内 Flash 范围校验会拒绝该地址，
 // 调用方必须显式传入 BOOT_SLOT_A_BASE 或 BOOT_SLOT_B_BASE。
 #define STM_OTA_DEFAULT_DOWNLOAD_ADDR  0x08080000U
 #define STM_OTA_DEFAULT_CHUNK          1024U
@@ -51,7 +51,7 @@ typedef struct {
     uint32_t prefix_crc32;
 } stm_ota_resume_state_t;
 
-// flash 工具（HAL 直调，限定 STM32F4）
+// Flash 工具（直接调用 HAL，仅支持 STM32F4）。
 static int flash_unlock(void)
 {
     HAL_FLASH_Unlock();
@@ -64,7 +64,7 @@ static int flash_lock(void)
     return 0;
 }
 
-// 按绝对地址计算 STM32F407 Flash sector
+// 根据绝对地址计算 STM32F407 Flash sector。
 static uint32_t addr_to_sector(uint32_t addr)
 {
     if (addr < 0x08004000U) return FLASH_SECTOR_0;
@@ -131,7 +131,7 @@ static int flash_write(uint32_t addr, const uint8_t *data, uint32_t len)
  * 只接受从槽位基址开始的连续写入。这样既能保护 Bootloader 区域，也能
  * 防止一次 OTA 跨过 A/B 边界或写入 B 槽末尾保留的 32 KiB。
  *
- * 返回值为 0 表示合法，并通过 aligned_size 返回按 Flash word 写入所需的
+ * 返回值为 0 表示合法，并通过 aligned_size 返回按 Flash 字写入所需的
  * 补齐长度。Flash 最后一个 word 可能包含 0xFF 填充，因此补齐后的范围也
  * 必须仍在槽位包上限内。
  */
@@ -163,7 +163,7 @@ static int validate_download_range(uint32_t addr, uint32_t total_size,
         return -1;
     }
 
-    /* flash_write() 按 32-bit word 编程，检查补齐后的最后一个 word。 */
+    /* flash_write() 按 32 位字编程，检查补齐后的最后一个字。 */
     if (total_size > (UINT32_MAX - 3U)) {
         return -1;
     }
@@ -176,7 +176,7 @@ static int validate_download_range(uint32_t addr, uint32_t total_size,
     return 0;
 }
 
-// 更新 CRC32 状态
+// 更新 CRC32 状态。
 static uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
 {
     for (uint32_t i = 0; i < len; i++) {
@@ -188,7 +188,7 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
     return crc;
 }
 
-// 计算 CRC32
+// 计算 CRC32。
 uint32_t stm_ota_crc32(const uint8_t *data, uint32_t len)
 {
     return crc32_update(0xFFFFFFFFU, data, len) ^ 0xFFFFFFFFU;
@@ -285,7 +285,7 @@ static bool resume_state_load(uint32_t addr, uint32_t total,
     return flash_crc == state->prefix_crc32;
 }
 
-// 解析 URL：http://host[:port]/path
+// 解析 URL：http://主机[:端口]/路径。
 static int parse_url(const char *url, char *host, uint16_t host_sz,
                      uint16_t *port, char *path, uint16_t path_sz)
 {
@@ -318,14 +318,14 @@ static int parse_url(const char *url, char *host, uint16_t host_sz,
     return 0;
 }
 
-// 文件级 static：stm_ota_download 末尾能 close
+// 文件级 static：供 stm_ota_download 结束时关闭连接。
 static esp_at_tcp_t s_tcp;
 static bool s_connected = false;
 static char s_host[64];
 static char s_path[64];
 static uint16_t s_port = 0;
 
-// 找 HTTP 头结束 "\r\n\r\n"，返回头结束偏移（含 \r\n\r\n 长度）
+// 查找 HTTP 头结束标记 "\r\n\r\n"，返回包含标记的结束偏移。
 static int find_header_end(const uint8_t *resp, uint32_t len)
 {
     for (uint32_t i = 0; i + 3 < len; i++) {
@@ -542,8 +542,8 @@ static void http_close(void)
     }
 }
 
-// HTTP 拉 1 个 chunk：raw TCP 长连接 + Range 头
-// host/port/path/tcp 在首次调用时建连接，后续复用
+// 通过原始 TCP 长连接和 Range 头拉取一个 HTTP 分片。
+// 首次调用建立 host/port/path/tcp 连接，后续调用复用连接。
 static int http_pull_chunk(const char *base_url, uint32_t offset, uint32_t want,
                            uint8_t *out, uint32_t *got,
                            uint32_t *package_crc32,
@@ -574,7 +574,7 @@ static int http_pull_chunk(const char *base_url, uint32_t offset, uint32_t want,
         return -1;
     }
 
-    // +IPD 帧 = HTTP 响应：状态行 + 头 + \r\n\r\n + body
+    // +IPD 帧就是 HTTP 响应：状态行 + 头 + \r\n\r\n + body。
     static uint8_t s_resp[STM_OTA_HTTP_RESP_BUF];       // HTTP 头 + 最大 OTA 分片
     uint32_t got_bytes = 0;
     if (esp_at_tcp_recv_body(&s_tcp, s_resp, sizeof s_resp, &got_bytes, 12000) != ESP_AT_OK) {
@@ -707,7 +707,7 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
     uint32_t addr = cfg->download_addr ? cfg->download_addr : STM_OTA_DEFAULT_DOWNLOAD_ADDR;
     uint32_t chunk = cfg->chunk_size ? cfg->chunk_size : STM_OTA_DEFAULT_CHUNK;
     uint32_t total = cfg->total_size;
-    static uint8_t s_buf[STM_OTA_MAX_CHUNK];           // 跳过 heap：测试期不依赖 malloc
+    static uint8_t s_buf[STM_OTA_MAX_CHUNK];           // 跳过堆分配：测试期间不依赖 malloc。
     uint32_t programmed_size = 0U;
 
     /* 所有参数先校验，再解锁/擦除 Flash，避免错误配置造成破坏性副作用。 */
@@ -853,8 +853,8 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
 
 stm_ota_err_t stm_ota_request_reboot(void)
 {
-    // 写备份寄存器 magic + 复位
-    // STM32F4 backup register 访问：先 PWR + 备份访问使能
+    // 写入备份寄存器 magic 并复位。
+    // STM32F4 备份寄存器访问：先开启 PWR 和备份域访问。
     __HAL_RCC_PWR_CLK_ENABLE();
     HAL_PWR_EnableBkUpAccess();
     WRITE_REG(RTC->BKP0R, STM_OTA_FLAG_MAGIC);

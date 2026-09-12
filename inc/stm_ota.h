@@ -25,25 +25,25 @@ typedef enum {
 typedef void (*stm_ota_progress_cb_t)(uint32_t done, uint32_t total, void *user);
 
 typedef struct {
-    uint32_t image_version;           // 远端镜像版本（MAJOR.MINOR.PATCH 打包值）
+    uint32_t image_version;           // 远端镜像版本（MAJOR.MINOR.PATCH 打包值）。
     uint32_t package_size;            // 完整 OTA 包大小
     uint32_t package_crc32;           // 完整 OTA 包 CRC32
     uint8_t  target_slot;             // 目标槽：0=A，1=B
 } stm_ota_image_info_t;
 
 typedef struct {
-    const char *url;                  // 必填，HTTP URL（服务端需支持 Range）
+    const char *url;                  // 必填，HTTP URL（服务端需支持 Range）。
     /*
      * STM32F407 A/B 工程中必须填写槽位基址（0x08008000 或 0x08040000）。
-     * 0 会解析为旧的默认 staging 地址，但该地址不在片内 Flash，最终会
+     * 0 会解析为旧的默认暂存地址，但该地址不在片内 Flash，最终会
      * 被严格校验拒绝；这样可以保留旧的 0 值语义，同时避免误擦写。
      */
     uint32_t    download_addr;
     /* 必须大于 0，且完整下载范围不能越过目标槽的 OTA 包上限。 */
     uint32_t    total_size;
-    /* 0 表示从首个 HTTP Range 响应的 X-CRC32 读取整包 CRC。 */
+    /* 0 表示从首个 HTTP Range 响应的 X-CRC32 读取完整包 CRC。 */
     uint32_t    crc32_expected;
-    uint32_t    chunk_size;            // 默认 1024，最大 1400（HTTP +IPD 缓存限制）
+    uint32_t    chunk_size;            // 默认 1024，最大 1400（HTTP +IPD 缓存限制）。
     stm_ota_progress_cb_t progress_cb;
     void       *progress_user;
 } stm_ota_config_t;
@@ -57,21 +57,21 @@ typedef struct {
 stm_ota_err_t stm_ota_probe(const char *url, stm_ota_image_info_t *info);
 
 /**
- * @brief HTTP 拉固件 chunk → 写 STM32 flash → CRC 校验
+ * @brief 通过 HTTP 拉取固件分片，写入 STM32 Flash 并进行 CRC 校验。
  *
  * 阻塞式（通常几十秒到几分钟）。失败立即返回错误码。
  */
 stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg);
 
 /**
- * @brief 写 bootloader 标志 + NVIC_SystemReset
+ * @brief 写入 Bootloader 标志并调用 NVIC_SystemReset。
  *
  * 写完后不返回（reset）。
  */
 stm_ota_err_t stm_ota_request_reboot(void);
 
 /**
- * @brief CRC-32 / IEEE polynomial 0xEDB88320
+ * @brief CRC-32 / IEEE 多项式 0xEDB88320。
  */
 uint32_t stm_ota_crc32(const uint8_t *data, uint32_t len);
 
