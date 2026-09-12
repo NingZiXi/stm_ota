@@ -41,7 +41,7 @@ stm_ota_config_t cfg = {
     .download_addr  = 0x08080000,           // App 之后的 download 区
     .total_size     = 256 * 1024,           // 固件大小
     .crc32_expected = 0x12345678,           // 服务端算的 CRC32
-    .chunk_size     = 512,
+    .chunk_size     = 1024,
     .progress_cb    = on_progress,
 };
 

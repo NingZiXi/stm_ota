@@ -23,7 +23,10 @@
 // 兼容旧配置的默认 staging 地址；F407 片内 Flash 范围校验会拒绝它，
 // 调用方必须显式传入 BOOT_SLOT_A_BASE 或 BOOT_SLOT_B_BASE。
 #define STM_OTA_DEFAULT_DOWNLOAD_ADDR  0x08080000U
-#define STM_OTA_DEFAULT_CHUNK          512U
+#define STM_OTA_DEFAULT_CHUNK          1024U
+#define STM_OTA_MAX_CHUNK              1400U
+#define STM_OTA_HTTP_RESP_BUF          4096U
+#define STM_OTA_LOG_EVERY_CHUNKS       16U
 #define STM_OTA_PREFLIGHT_BYTES        8U
 #define STM_OTA_HTTP_TIMEOUT_MS        8000U
 #define STM_OTA_FLAG_ADDR              0x40024000U   // 备份寄存器：实际放 (BKP_BASE + 0x04)
@@ -572,7 +575,7 @@ static int http_pull_chunk(const char *base_url, uint32_t offset, uint32_t want,
     }
 
     // +IPD 帧 = HTTP 响应：状态行 + 头 + \r\n\r\n + body
-    static uint8_t s_resp[STM_OTA_DEFAULT_CHUNK * 2];   // 1KB 够放响应头 + 512 字节 body
+    static uint8_t s_resp[STM_OTA_HTTP_RESP_BUF];       // HTTP 头 + 最大 OTA 分片
     uint32_t got_bytes = 0;
     if (esp_at_tcp_recv_body(&s_tcp, s_resp, sizeof s_resp, &got_bytes, 12000) != ESP_AT_OK) {
         LOGE("ota", "recv body failed");
@@ -704,7 +707,7 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
     uint32_t addr = cfg->download_addr ? cfg->download_addr : STM_OTA_DEFAULT_DOWNLOAD_ADDR;
     uint32_t chunk = cfg->chunk_size ? cfg->chunk_size : STM_OTA_DEFAULT_CHUNK;
     uint32_t total = cfg->total_size;
-    static uint8_t s_buf[STM_OTA_DEFAULT_CHUNK];      // 跳过 heap：测试期不依赖 malloc
+    static uint8_t s_buf[STM_OTA_MAX_CHUNK];           // 跳过 heap：测试期不依赖 malloc
     uint32_t programmed_size = 0U;
 
     /* 所有参数先校验，再解锁/擦除 Flash，避免错误配置造成破坏性副作用。 */
@@ -792,16 +795,22 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
             return STM_OTA_ERR_FLASH;
         }
         uint32_t flash_crc = stm_ota_crc32((const uint8_t *)(addr + done), got);
-        LOGI("ota", "chunk %lu len=%lu rx_crc=0x%08lX flash_crc=0x%08lX",
-             (unsigned long)done, (unsigned long)got,
-             (unsigned long)chunk_crc, (unsigned long)flash_crc);
         if (flash_crc != chunk_crc) {
             flash_lock();
             http_close();
             resume_state_clear();
             return STM_OTA_ERR_FLASH;
         }
+        const uint32_t chunk_start = done;
         done += got;
+        if (chunk_start == 0U || done >= total
+            || ((done / chunk) % STM_OTA_LOG_EVERY_CHUNKS) == 0U) {
+            LOGI("ota", "chunk %lu len=%lu rx_crc=0x%08lX flash_crc=0x%08lX "
+                 "progress=%lu/%lu",
+                 (unsigned long)chunk_start, (unsigned long)got,
+                 (unsigned long)chunk_crc, (unsigned long)flash_crc,
+                 (unsigned long)done, (unsigned long)total);
+        }
 
         if (package_crc_known) {
             resume.download_addr = addr;

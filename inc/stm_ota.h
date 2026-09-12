@@ -43,7 +43,7 @@ typedef struct {
     uint32_t    total_size;
     /* 0 表示从首个 HTTP Range 响应的 X-CRC32 读取整包 CRC。 */
     uint32_t    crc32_expected;
-    uint32_t    chunk_size;            // 默认 512，<= 1400（AT_RESP_TEXT_MAX 推荐）
+    uint32_t    chunk_size;            // 默认 1024，最大 1400（HTTP +IPD 缓存限制）
     stm_ota_progress_cb_t progress_cb;
     void       *progress_user;
 } stm_ota_config_t;
