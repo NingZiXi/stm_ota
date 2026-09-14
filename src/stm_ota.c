@@ -54,8 +54,7 @@ typedef struct {
 // Flash 工具（直接调用 HAL，仅支持 STM32F4）。
 static int flash_unlock(void)
 {
-    HAL_FLASH_Unlock();
-    return 0;
+    return HAL_FLASH_Unlock() == HAL_OK ? 0 : -1;
 }
 
 static int flash_lock(void)
@@ -712,7 +711,7 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
 
     /* 所有参数先校验，再解锁/擦除 Flash，避免错误配置造成破坏性副作用。 */
     if (validate_download_range(addr, total, &programmed_size) != 0
-        || chunk > sizeof s_buf) {
+        || chunk < 4U || (chunk & 0x3U) != 0U || chunk > sizeof s_buf) {
         return STM_OTA_ERR_INVALID;
     }
 
