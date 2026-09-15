@@ -27,10 +27,5 @@ if(TARGET stm_log)
     target_link_libraries(stm_ota PUBLIC stm_log)
 endif()
 
-# 内联 FreeRTOS（vPortMalloc / xSemaphoreCreate 等）
-if(TARGET stm32cubemx)
-    target_link_libraries(stm_ota PUBLIC stm32cubemx)
-endif()
-
 # C11
 target_compile_features(stm_ota PUBLIC c_std_11)

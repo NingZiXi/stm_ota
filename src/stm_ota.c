@@ -13,12 +13,8 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
 
 #include "stm32f4xx_hal.h"             // 内部 HAL：stm_ota 限定 STM32F4
-#include "FreeRTOS.h"
-#include "semphr.h"
-#include "cmsis_os2.h"
 
 // 兼容旧配置的默认暂存地址；F407 片内 Flash 范围校验会拒绝该地址，
 // 调用方必须显式传入 BOOT_SLOT_A_BASE 或 BOOT_SLOT_B_BASE。
@@ -29,6 +25,8 @@
 #define STM_OTA_LOG_EVERY_CHUNKS       16U
 #define STM_OTA_PREFLIGHT_BYTES        8U
 #define STM_OTA_HTTP_TIMEOUT_MS        8000U
+#define STM_OTA_HTTP_RETRY_COUNT       3U
+#define STM_OTA_HTTP_RETRY_DELAY_MS    100U
 #define STM_OTA_FLAG_ADDR              0x40024000U   // 备份寄存器：实际放 (BKP_BASE + 0x04)
 #define STM_OTA_FLAG_MAGIC             0x0FADE001U
 #define STM_OTA_RESUME_MAGIC           0x3152544FU   // "OTR1"
@@ -288,9 +286,13 @@ static bool resume_state_load(uint32_t addr, uint32_t total,
 static int parse_url(const char *url, char *host, uint16_t host_sz,
                      uint16_t *port, char *path, uint16_t path_sz)
 {
-    const char *p = strstr(url, "://");
-    if (!p) return -1;
-    p += 3;
+    static const char scheme[] = "http://";
+    if (url == NULL || host == NULL || host_sz < 2U || port == NULL
+        || path == NULL || path_sz < 2U
+        || strncmp(url, scheme, sizeof scheme - 1U) != 0) {
+        return -1;
+    }
+    const char *p = url + sizeof scheme - 1U;
     const char *slash = strchr(p, '/');
     const char *colon = strchr(p, ':');
     if (colon && (!slash || colon < slash)) {
@@ -298,7 +300,17 @@ static int parse_url(const char *url, char *host, uint16_t host_sz,
         if (h_len >= host_sz) return -1;
         memcpy(host, p, h_len);
         host[h_len] = '\0';
-        *port = (uint16_t)atoi(colon + 1);
+        const char *port_text = colon + 1;
+        const char *port_end = slash ? slash : p + strlen(p);
+        uint32_t parsed_port = 0U;
+        if (port_text == port_end) return -1;
+        while (port_text < port_end) {
+            if (*port_text < '0' || *port_text > '9') return -1;
+            parsed_port = parsed_port * 10U + (uint32_t)(*port_text++ - '0');
+            if (parsed_port > UINT16_MAX) return -1;
+        }
+        if (parsed_port == 0U) return -1;
+        *port = (uint16_t)parsed_port;
         p = slash ? slash : p + strlen(p);
     } else {
         const char *end = slash ? slash : (p + strlen(p));
@@ -670,6 +682,38 @@ static int http_pull_chunk(const char *base_url, uint32_t offset, uint32_t want,
     return 0;
 }
 
+/*
+ * ESP-AT 的 TCP 连接可能在长时间 Range 下载中瞬时关闭，或短暂拒绝
+ * CIPSEND。只重试当前分片，每次失败先关闭旧连接再重新建立；上层仍然
+ * 负责 CRC 校验和最终失败时的断点状态清理。
+ */
+static int http_pull_chunk_with_retry(const char *base_url,
+                                      uint32_t offset,
+                                      uint32_t want,
+                                      uint8_t *out,
+                                      uint32_t *got,
+                                      uint32_t *package_crc32,
+                                      stm_ota_image_info_t *image_info)
+{
+    for (uint32_t attempt = 1U; attempt <= STM_OTA_HTTP_RETRY_COUNT; attempt++) {
+        if (http_pull_chunk(base_url, offset, want, out, got,
+                            package_crc32, image_info) == 0) {
+            return 0;
+        }
+
+        http_close();
+        if (attempt < STM_OTA_HTTP_RETRY_COUNT) {
+            LOGW("ota", "range %lu-%lu retry %lu/%lu",
+                 (unsigned long)offset,
+                 (unsigned long)(offset + want - 1U),
+                 (unsigned long)(attempt + 1U),
+                 (unsigned long)STM_OTA_HTTP_RETRY_COUNT);
+            HAL_Delay(STM_OTA_HTTP_RETRY_DELAY_MS);
+        }
+    }
+    return -1;
+}
+
 stm_ota_err_t stm_ota_probe(const char *url, stm_ota_image_info_t *info)
 {
     if (url == NULL || url[0] == '\0' || info == NULL) {
@@ -682,8 +726,8 @@ stm_ota_err_t stm_ota_probe(const char *url, stm_ota_image_info_t *info)
     uint8_t probe[STM_OTA_PREFLIGHT_BYTES];
     uint32_t got = 0U;
     uint32_t package_crc = 0U;
-    const int rc = http_pull_chunk(url, 0U, sizeof probe, probe, &got,
-                                   &package_crc, info);
+    const int rc = http_pull_chunk_with_retry(url, 0U, sizeof probe, probe, &got,
+                                              &package_crc, info);
     http_close();
     if (rc != 0 || got != sizeof probe) {
         return STM_OTA_ERR_HTTP;
@@ -706,7 +750,7 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
     uint32_t addr = cfg->download_addr ? cfg->download_addr : STM_OTA_DEFAULT_DOWNLOAD_ADDR;
     uint32_t chunk = cfg->chunk_size ? cfg->chunk_size : STM_OTA_DEFAULT_CHUNK;
     uint32_t total = cfg->total_size;
-    static uint8_t s_buf[STM_OTA_MAX_CHUNK];           // 跳过堆分配：测试期间不依赖 malloc。
+    static uint8_t s_buf[STM_OTA_MAX_CHUNK];           // 固定静态下载缓冲，不依赖 heap。
     uint32_t programmed_size = 0U;
 
     /* 所有参数先校验，再解锁/擦除 Flash，避免错误配置造成破坏性副作用。 */
@@ -766,9 +810,11 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
 
         uint32_t got = 0;
         uint32_t response_crc = 0U;
-        if (http_pull_chunk(cfg->url, done, want, s_buf, &got,
-                            &response_crc, NULL) != 0) {
+        if (http_pull_chunk_with_retry(cfg->url, done, want, s_buf, &got,
+                                       &response_crc, NULL) != 0) {
             flash_lock();
+            http_close();
+            resume_state_clear();
             return STM_OTA_ERR_HTTP;
         }
         if (!package_crc_known) {
@@ -829,7 +875,10 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
 
     http_close();
 
-    if (done != total) return STM_OTA_ERR_HTTP;
+    if (done != total) {
+        resume_state_clear();
+        return STM_OTA_ERR_HTTP;
+    }
 
     if (package_crc_known) {
         uint32_t rx_crc = download_crc ^ 0xFFFFFFFFU;
