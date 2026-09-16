@@ -123,21 +123,15 @@ osThreadNew(app_freertos_ota_task, NULL, &ota_task_attributes);
 其他任务不得并发调用 ESP-AT 或 OTA 同步 API。需要触发更新时只调用
 `app_freertos_ota_demo_request()`。
 
-## 7. 加入构建
+## 7. 复制到主工程验证
 
-裸机：
+示例不会自动加入库构建，避免把应用策略或 RTOS 依赖带进 `stm_ota`。需要硬件验证时，
+把 `ota_ab_demo.c` 中需要验证的状态机和对应包装临时复制进应用已有的 `app_ota.c`，
+填入本项目 Bootloader 回调后，直接使用应用原有构建流程。直接粘贴到已有源文件可避免
+为了一个示例修改 CMake。
 
-```cmake
-target_sources(your_app PRIVATE
-    Lib/stm_ota/example/ota_ab_demo.c
-    Lib/stm_ota/example/baremetal_ota_demo.c
-)
-target_include_directories(your_app PRIVATE Lib/stm_ota/example)
-target_link_libraries(your_app PRIVATE stm_ota)
-```
-
-FreeRTOS 将 `baremetal_ota_demo.c` 换成 `freertos_ota_demo.c`。示例不会自动加入库构建，避免把
-应用策略或 RTOS 依赖带进 `stm_ota`。
+验证完成后，把确认过的通用逻辑同步回本目录，并还原主工程的临时接线代码；无需为示例
+长期维护额外 CMake 预设或烧录脚本。
 
 ## 8. 成功与失败标准
 
