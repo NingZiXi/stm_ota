@@ -64,8 +64,10 @@ stm_ota_err_t stm_ota_probe(const char *url, stm_ota_image_info_t *info);
 stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg);
 
 /**
- * @brief 写入 Bootloader 标志并调用 NVIC_SystemReset。
+ * @brief 写入旧版通用 Bootloader 标志并调用 NVIC_SystemReset
  *
+ * 这是兼容旧工程的接口，只写入旧版 BKP0R magic。A/B 工程必须由应用先按
+ * 自己的 Bootloader 状态协议写入 pending 槽，不能用本接口代替 pending 请求。
  * 写完后不返回（reset）。
  */
 stm_ota_err_t stm_ota_request_reboot(void);

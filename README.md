@@ -62,6 +62,9 @@ if (r == STM_OTA_OK) {
 /* 下载成功后由应用写入本项目的 pending_slot，再执行 NVIC_SystemReset()。 */
 ```
 
+完整的 A/B 版本门禁、进度、pending 适配及裸机/FreeRTOS 调用方式见
+[example/README.md](example/README.md)。
+
 ## 服务端协议
 
 STM32 使用标准 `Range: bytes=N-M` 请求分块读取固件。服务端返回 `206 Partial Content`，
@@ -79,8 +82,17 @@ STM32 使用标准 `Range: bytes=N-M` 请求分块读取固件。服务端返回
 stm_ota/
 ├── CMakeLists.txt
 ├── README.md
+├── ADMIN.md
+├── example/
+│   ├── README.md
+│   ├── ota_ab_demo.c
+│   ├── ota_ab_demo.h
+│   ├── baremetal_ota_demo.c
+│   └── freertos_ota_demo.c
 ├── inc/
 │   └── stm_ota.h
 └── src/
     └── stm_ota.c
 ```
+
+维护架构、Flash/断点约束、故障注入和发布门禁见 [ADMIN.md](ADMIN.md)。
