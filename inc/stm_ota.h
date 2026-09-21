@@ -8,19 +8,12 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "stm_err.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef enum {
-    STM_OTA_OK            = 0,
-    STM_OTA_ERR_INVALID   = -1,
-    STM_OTA_ERR_HTTP       = -2,
-    STM_OTA_ERR_FLASH      = -3,
-    STM_OTA_ERR_CRC        = -4,
-    STM_OTA_ERR_TIMEOUT    = -5,
-} stm_ota_err_t;
 
 typedef void (*stm_ota_progress_cb_t)(uint32_t done, uint32_t total, void *user);
 
@@ -43,7 +36,7 @@ typedef struct {
     uint32_t    total_size;
     /* 0 表示从首个 HTTP Range 响应的 X-CRC32 读取完整包 CRC。 */
     uint32_t    crc32_expected;
-    uint32_t    chunk_size;            // 默认 1024，最大 1400（HTTP +IPD 缓存限制）。
+    uint32_t    chunk_size;            // 0=默认1024；否则4～1400且4字节对齐。
     stm_ota_progress_cb_t progress_cb;
     void       *progress_user;
 } stm_ota_config_t;
@@ -53,15 +46,18 @@ typedef struct {
  *
  * 通过一个极小的 HTTP Range 请求读取服务端响应头，供应用在完整下载前完成
  * 版本、槽位和包大小检查。
+ * @return STM_OK 成功；STM_ERR_INVALID_ARG 参数无效；STM_ERR_IO 网络/响应失败。
  */
-stm_ota_err_t stm_ota_probe(const char *url, stm_ota_image_info_t *info);
+stm_err_t stm_ota_probe(const char *url, stm_ota_image_info_t *info);
 
 /**
  * @brief 通过 HTTP 拉取固件分片，写入 STM32 Flash 并进行 CRC 校验。
  *
  * 阻塞式（通常几十秒到几分钟）。失败立即返回错误码。
+ * @return STM_OK 成功；INVALID_ARG 参数无效；IO 网络/Flash 失败；VERIFY CRC 不一致。
+ * @note 返回码为 stm_err_t 正数，不可用 <0 判断。只允许单调用者；不可从 AT 回调调用。
  */
-stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg);
+stm_err_t stm_ota_download(const stm_ota_config_t *cfg);
 
 /**
  * @brief 写入旧版通用 Bootloader 标志并调用 NVIC_SystemReset
@@ -70,7 +66,7 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg);
  * 自己的 Bootloader 状态协议写入 pending 槽，不能用本接口代替 pending 请求。
  * 写完后不返回（reset）。
  */
-stm_ota_err_t stm_ota_request_reboot(void);
+stm_err_t stm_ota_request_reboot(void);
 
 /**
  * @brief CRC-32 / IEEE 多项式 0xEDB88320。

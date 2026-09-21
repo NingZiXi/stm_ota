@@ -4,6 +4,7 @@
  */
 
 #include "stm_ota.h"
+#include "stm_log.h"
 
 /* A/B 槽边界由应用与 Bootloader 共用，避免 OTA 库重复维护地址。 */
 #include "../../../common/boot_state_protocol.h"
@@ -570,7 +571,7 @@ static int http_pull_chunk(const char *base_url, uint32_t offset, uint32_t want,
             LOGE("ota", "bad url: %s", base_url);
             return -1;
         }
-        if (esp_at_tcp_connect(&s_tcp, s_host, s_port, 8000) != ESP_AT_OK) {
+        if (esp_at_tcp_connect(&s_tcp, s_host, s_port, 8000) != STM_OK) {
             LOGE("ota", "TCP connect %s:%u failed", s_host, s_port);
             return -1;
         }
@@ -578,7 +579,7 @@ static int http_pull_chunk(const char *base_url, uint32_t offset, uint32_t want,
     }
 
     if (esp_at_tcp_http_get_range(&s_tcp, s_host, s_path,
-                                    offset, want, STM_OTA_HTTP_TIMEOUT_MS) != ESP_AT_OK) {
+                                    offset, want, STM_OTA_HTTP_TIMEOUT_MS) != STM_OK) {
         LOGE("ota", "HTTP GET range %lu-%lu failed", offset, offset + want - 1);
         esp_at_tcp_close(&s_tcp);
         s_connected = false;
@@ -588,7 +589,7 @@ static int http_pull_chunk(const char *base_url, uint32_t offset, uint32_t want,
     // +IPD 帧就是 HTTP 响应：状态行 + 头 + \r\n\r\n + body。
     static uint8_t s_resp[STM_OTA_HTTP_RESP_BUF];       // HTTP 头 + 最大 OTA 分片
     uint32_t got_bytes = 0;
-    if (esp_at_tcp_recv_body(&s_tcp, s_resp, sizeof s_resp, &got_bytes, 12000) != ESP_AT_OK) {
+    if (esp_at_tcp_recv_body(&s_tcp, s_resp, sizeof s_resp, &got_bytes, 12000) != STM_OK) {
         LOGE("ota", "recv body failed");
         esp_at_tcp_close(&s_tcp);
         s_connected = false;
@@ -714,10 +715,10 @@ static int http_pull_chunk_with_retry(const char *base_url,
     return -1;
 }
 
-stm_ota_err_t stm_ota_probe(const char *url, stm_ota_image_info_t *info)
+stm_err_t stm_ota_probe(const char *url, stm_ota_image_info_t *info)
 {
     if (url == NULL || url[0] == '\0' || info == NULL) {
-        return STM_OTA_ERR_INVALID;
+        return STM_ERR_INVALID_ARG;
     }
 
     memset(info, 0, sizeof *info);
@@ -730,7 +731,7 @@ stm_ota_err_t stm_ota_probe(const char *url, stm_ota_image_info_t *info)
                                               &package_crc, info);
     http_close();
     if (rc != 0 || got != sizeof probe) {
-        return STM_OTA_ERR_HTTP;
+        return STM_ERR_IO;
     }
 
     LOGI("ota", "preflight slot=%c version=0x%08lX size=%lu crc=0x%08lX",
@@ -738,13 +739,13 @@ stm_ota_err_t stm_ota_probe(const char *url, stm_ota_image_info_t *info)
          (unsigned long)info->image_version,
          (unsigned long)info->package_size,
          (unsigned long)info->package_crc32);
-    return STM_OTA_OK;
+    return STM_OK;
 }
 
-stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
+stm_err_t stm_ota_download(const stm_ota_config_t *cfg)
 {
     if (!cfg || !cfg->url || cfg->url[0] == '\0') {
-        return STM_OTA_ERR_INVALID;
+        return STM_ERR_INVALID_ARG;
     }
 
     uint32_t addr = cfg->download_addr ? cfg->download_addr : STM_OTA_DEFAULT_DOWNLOAD_ADDR;
@@ -756,7 +757,7 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
     /* 所有参数先校验，再解锁/擦除 Flash，避免错误配置造成破坏性副作用。 */
     if (validate_download_range(addr, total, &programmed_size) != 0
         || chunk < 4U || (chunk & 0x3U) != 0U || chunk > sizeof s_buf) {
-        return STM_OTA_ERR_INVALID;
+        return STM_ERR_INVALID_ARG;
     }
 
     uint32_t done = 0;
@@ -783,13 +784,13 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
 
     if (flash_unlock() != 0) {
         resume_state_clear();
-        return STM_OTA_ERR_FLASH;
+        return STM_ERR_IO;
     }
     if (!resume_accepted) {
         if (flash_erase(addr, programmed_size) != 0) {
             flash_lock();
             resume_state_clear();
-            return STM_OTA_ERR_FLASH;
+            return STM_ERR_IO;
         }
         if (package_crc_known) {
             resume = (stm_ota_resume_state_t) {
@@ -815,7 +816,7 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
             flash_lock();
             http_close();
             resume_state_clear();
-            return STM_OTA_ERR_HTTP;
+            return STM_ERR_IO;
         }
         if (!package_crc_known) {
             package_crc = response_crc;
@@ -827,7 +828,7 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
             flash_lock();
             http_close();
             resume_state_clear();
-            return STM_OTA_ERR_CRC;
+            return STM_ERR_VERIFY;
         }
         if (got == 0) break;
 
@@ -837,14 +838,14 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
             flash_lock();
             http_close();
             resume_state_clear();
-            return STM_OTA_ERR_FLASH;
+            return STM_ERR_IO;
         }
         uint32_t flash_crc = stm_ota_crc32((const uint8_t *)(addr + done), got);
         if (flash_crc != chunk_crc) {
             flash_lock();
             http_close();
             resume_state_clear();
-            return STM_OTA_ERR_FLASH;
+            return STM_ERR_IO;
         }
         const uint32_t chunk_start = done;
         done += got;
@@ -877,7 +878,7 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
 
     if (done != total) {
         resume_state_clear();
-        return STM_OTA_ERR_HTTP;
+        return STM_ERR_IO;
     }
 
     if (package_crc_known) {
@@ -888,18 +889,18 @@ stm_ota_err_t stm_ota_download(const stm_ota_config_t *cfg)
              (unsigned long)package_crc);
         if (rx_crc != package_crc || flash_crc != package_crc) {
             resume_state_clear();
-            return STM_OTA_ERR_CRC;
+            return STM_ERR_VERIFY;
         }
     } else {
         resume_state_clear();
-        return STM_OTA_ERR_CRC;
+        return STM_ERR_VERIFY;
     }
 
     resume_state_clear();
-    return STM_OTA_OK;
+    return STM_OK;
 }
 
-stm_ota_err_t stm_ota_request_reboot(void)
+stm_err_t stm_ota_request_reboot(void)
 {
     // 写入备份寄存器 magic 并复位。
     // STM32F4 备份寄存器访问：先开启 PWR 和备份域访问。
@@ -909,5 +910,5 @@ stm_ota_err_t stm_ota_request_reboot(void)
     HAL_PWR_DisableBkUpAccess();
 
     NVIC_SystemReset();
-    return STM_OTA_OK;     // 实际不会返回
+    return STM_OK;     // 实际不会返回
 }

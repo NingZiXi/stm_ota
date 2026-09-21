@@ -80,7 +80,7 @@ Flash 扇区布局、擦除粒度、编程粒度和地址范围，不能只替�
 8. 调用进度回调。
 
 结束时再次计算整个目标包的 Flash CRC，只有
-`接收 CRC == Flash CRC == 服务端期望 CRC` 才返回 `STM_OTA_OK`。
+`接收 CRC == Flash CRC == 服务端期望 CRC` 才返回 `STM_OK`。
 
 ## 4. Flash 安全约束
 
@@ -121,20 +121,25 @@ magic 最后写入，避免复位发生在状态更新中间时误接受半写�
 
 ## 6. 失败语义
 
+直接返回 stm_common 的 `stm_err_t`，`STM_OK=0`，失败为正数；用 `!= STM_OK` 判断。
+现有 HTTP 重试辅助层将终态失败归为 `STM_ERR_IO`，并非所有网络超时都会单独透传。
+本轮不新增 OTA 私有错误区间，也不把 Flash HAL 状态直接当错误码返回。
+
 | 错误码 | 含义 | 应用建议 |
 | --- | --- | --- |
-| `STM_OTA_ERR_INVALID` | URL、范围、大小或分片配置非法 | 修正配置，不重试 |
-| `STM_OTA_ERR_HTTP` | TCP/Range/HTTP 响应失败 | 网络恢复后重新触发完整流程 |
-| `STM_OTA_ERR_FLASH` | 解锁、擦除、写入或回读失败 | 保留旧 active 槽，记录硬件故障 |
-| `STM_OTA_ERR_CRC` | 响应头 CRC 改变或整包 CRC 不一致 | 拒绝 pending，重新发布或下载 |
-| `STM_OTA_ERR_TIMEOUT` | 预留的超时分类 | 按网络故障处理 |
+| `STM_ERR_INVALID_ARG` | URL、范围、大小或分片配置非法 | 修正配置，不重试 |
+| `STM_ERR_IO` | TCP/HTTP 或 Flash 解锁、擦除、写入失败 | 保留旧 active 槽，结合日志区分网络和硬件问题 |
+| `STM_ERR_VERIFY` | 响应头 CRC 改变或整包 CRC 不一致 | 拒绝 pending，重新发布或下载 |
+| `STM_ERR_TIMEOUT` | 预留的超时分类 | 按网络故障处理 |
 
-任何失败都不能写 pending 或修改 active。只有 `stm_ota_download()` 返回 `STM_OTA_OK`，并且应用
+任何失败都不能写 pending 或修改 active。只有 `stm_ota_download()` 返回 `STM_OK`，并且应用
 再次核对 metadata/版本后，才允许请求 Bootloader 试启动目标槽。
 
 ## 7. 与 Bootloader 的集成边界
 
-库不知道项目如何编码 active/pending，也不直接依赖 Bootloader 头文件。应用层必须提供：
+库不写 A/B active/pending，但目前通过相对路径引用应用 `common/boot_state_protocol.h` 的槽布局。
+这是现有 F407 工程依赖，不能宣称可在总库中独立用于任意板型；本轮不重构 Flash/状态协议。
+应用层必须提供：
 
 - 根据 `SCB->VTOR` 识别当前运行槽；
 - 选择另一槽和对应 URL/地址；

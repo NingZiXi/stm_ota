@@ -1,149 +1,55 @@
-# stm_ota 示例程序
+# stm_ota 单文件示例
 
-本目录提供完整的 A/B OTA 业务参考流程，并把项目特有的 Bootloader 状态协议隔离为四个回调。
-这样 `stm_ota` 库继续只负责下载、Flash 和 CRC，不与某个 pending 编码耦合。
+只保留 `main.c`：从网络初始化、MQTT 请求到版本门禁、下载、pending 和复位顺序阅读。
+没有示例头文件、配置回调表或裸机/RTOS 多层包装；日志统一使用 stm_log。
 
-## 1. 文件
+## 使用前必须完成
 
-| 文件 | 作用 |
+这是 STM32F407 A/B 布局的参考应用，不是可直接烧录的独立 BSP。
+库仍依赖主工程 `common/boot_state_protocol.h` 的布局、F4 HAL、ESP-AT 和 stm_common。
+
+应用需要实现 main.c 声明的四个函数：
+
+| 函数 | 契约 |
 | --- | --- |
-| `ota_ab_demo.h/.c` | probe、版本门禁、下载、metadata 复核、pending 和复位 |
-| `baremetal_ota_demo.c` | 裸机 `while (1)` 包装 |
-| `freertos_ota_demo.c` | CMSIS-RTOS 单任务包装，RTOS 仅存在于应用层 |
+| `board_init(&port)` | HAL、时钟、GPIO、UART/DMA、NVIC、tick、stm_log；填写有效端口 |
+| `board_read_verified_version(slot, &version)` | 校验 metadata/CRC；生产配置验签，成功才返回版本 |
+| `board_request_pending(slot)` | 按 Bootloader 协议写入并读回 pending，不修改 active |
+| `board_confirm_boot(slot)` | 检查试启动/当前槽，健康成功后确认，不可盲写 active |
 
-## 2. 必须提供的 Bootloader 适配
+这些函数故意不提供“返回成功”的空实现；未接入时链接失败，避免误擦写或绕过校验。
+错误返回统一 `stm_err_t`，`STM_OK=0`，其他为正数。
 
-应用必须实现以下能力并填入 `ota_ab_demo_boot_ops_t`：
+把示例中的地址、容量、URL、Wi-Fi 和 MQTT 配置替换成自己的值。
+本示例 A=`0x08008000`、B=`0x08040000`、OTA 包容量 224 KiB；
+必须与 Bootloader、链接脚本、包格式完全一致。
 
-```c
-static uint8_t app_get_running_slot(void *user)
-{
-    (void)user;
-    return boot_state_get_running_slot();       /* 通常根据 SCB->VTOR */
-}
+## 运行过程
 
-static bool app_read_version(uint8_t slot, uint32_t *version, void *user)
-{
-    (void)user;
-    return app_read_image_version(slot, version); /* 读取并校验 metadata */
-}
+1. 根据 VTOR 识别运行槽并校验当前镜像；未知槽拒绝 OTA。
+2. 初始化 ESP-AT、Wi-Fi、CIPMUX、MQTT 和控制主题订阅。
+3. 持续轮询 5 秒后确认健康；任何初始化失败都不确认。
+4. 向 `stm32/example/ota/control` 发送 `update`；回调只置标志。
+5. 主循环 probe 非运行槽，拒绝同版本/降级、错槽和超容量。
+6. 下载后校验目标镜像及版本，写入并读回 pending，然后复位。
+7. Bootloader 再校验并试启动；新应用健康确认后成为 active。
 
-static bool app_request_pending(uint8_t slot, void *user)
-{
-    (void)user;
-    return boot_state_request_slot(slot);       /* 写入后必须读回确认 */
-}
+**下载会擦除非运行槽。** 不能用假槽位或未经校验的 VTOR 试运行。
+失败不写 pending、不改 active；CRC 不是签名认证。
+公网 MQTT 无认证仅适合实验室；产品须另行设计命令授权。
 
-static void app_reset(void *user)
-{
-    (void)user;
-    NVIC_SystemReset();
-}
-```
+## 在已有项目中验证
 
-上面的函数名来自本项目，其他工程应替换为自己的 Bootloader 适配。不要在库内复制另一份状态协议。
+本 OTA 工程保留已有 `app_main()` 和板级入口，临时把示例流程复制进现有业务文件，
+按已有 Bootloader API 实现四个板级函数，不新增示例预设。
+新建工程则把本文件作为唯一 main，另行提供 BSP 和启动文件。
 
-## 3. 创建 A/B 配置
+FreeRTOS 使用同样流程放入一个任务，端口 delay_ms 注入 osDelay 包装；
+不要从另一个任务或 MQTT 回调调用同步 API。不需要额外的 RTOS 示例包装源文件。
 
-```c
-static void on_progress(uint32_t done, uint32_t total, void *user)
-{
-    (void)user;
-    LOGI("ota", "%lu/%lu", (unsigned long)done, (unsigned long)total);
-}
+本轮完成源码/编译检查，最新硬件回归待 F407 接回。真正通过需同时记录
+下载 CRC、pending、切槽 VTOR、active、健康确认及 Fault 寄存器，不能只看返回值。
 
-static const ota_ab_demo_config_t s_ota_config = {
-    .slot_url = {
-        "http://192.168.1.100:8081/firmware-A.ota.bin",
-        "http://192.168.1.100:8081/firmware-B.ota.bin",
-    },
-    .slot_base = {0x08008000U, 0x08040000U},
-    .slot_capacity = 224U * 1024U,
-    .chunk_size = 1024U,
-    .allow_downgrade = false,
-    .progress_cb = on_progress,
-    .progress_user = NULL,
-    .boot = {
-        .get_running_slot = app_get_running_slot,
-        .read_image_version = app_read_version,
-        .request_pending_slot = app_request_pending,
-        .system_reset = app_reset,
-        .user = NULL,
-    },
-};
-```
-
-地址和容量必须来自项目唯一的 Flash 布局定义，不能在多个模块中各维护一份。
-
-## 4. MQTT 回调
-
-事件回调只记录请求：
-
-```c
-static void on_mqtt_message(const esp_at_event_payload_t *event, void *user)
-{
-    (void)user;
-    if (event->type == ESP_AT_EVENT_MQTT_MESSAGE
-        && event->data_len == 6U
-        && memcmp(event->data, "update", 6U) == 0) {
-        app_baremetal_ota_demo_request();
-    }
-}
-```
-
-不能在 MQTT 回调内直接调用 `stm_ota_probe()` 或 `stm_ota_download()`，否则会重入 ESP-AT
-同步命令状态机。
-
-## 5. 裸机用法
-
-```c
-/* Wi-Fi、CIPMUX、MQTT 连接和订阅成功后： */
-if (!app_baremetal_ota_demo_init(&s_ota_config)) {
-    Error_Handler();
-}
-
-for (;;) {
-    app_baremetal_ota_demo_process();
-    HAL_Delay(1U);
-}
-```
-
-## 6. FreeRTOS 用法
-
-ESP-AT 初始化时注入 `osDelay()` 包装，之后只创建一个拥有 ESP-AT/OTA 的任务：
-
-```c
-if (!app_freertos_ota_demo_init(&s_ota_config)) {
-    Error_Handler();
-}
-
-osThreadNew(app_freertos_ota_task, NULL, &ota_task_attributes);
-```
-
-其他任务不得并发调用 ESP-AT 或 OTA 同步 API。需要触发更新时只调用
-`app_freertos_ota_demo_request()`。
-
-## 7. 复制到主工程验证
-
-示例不会自动加入库构建，避免把应用策略或 RTOS 依赖带进 `stm_ota`。需要硬件验证时，
-把 `ota_ab_demo.c` 中需要验证的状态机和对应包装临时复制进应用已有的 `app_ota.c`，
-填入本项目 Bootloader 回调后，直接使用应用原有构建流程。直接粘贴到已有源文件可避免
-为了一个示例修改 CMake。
-
-验证完成后，把确认过的通用逻辑同步回本目录，并还原主工程的临时接线代码；无需为示例
-长期维护额外 CMake 预设或烧录脚本。
-
-## 8. 成功与失败标准
-
-成功必须同时满足：
-
-- probe 槽位与目标槽一致；
-- 版本门禁通过；
-- 包大小不超过槽容量；
-- 接收 CRC、Flash CRC、期望 CRC 一致；
-- 下载后 metadata 版本与 probe 一致；
-- pending 写入并读回成功；
-- Bootloader 校验通过并试启动；
-- 新 App 健康确认后 active 更新且 pending 清除。
-
-任一步失败都不得写 pending，旧 active 槽应继续可启动。
+板级初始化日志时，先设置 `stm_log_set_tick(HAL_GetTick)`，再使用
+`stm_log_init_output(output, STM_LOG_LVL_INFO)`。UART 和 RTT 都由应用回调提供，
+不能把诊断日志输出到 ESP-AT 协议使用的 USART2。完整后端例子见 stm_log README。
